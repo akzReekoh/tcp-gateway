@@ -1,27 +1,24 @@
 'use strict';
 
-var domain            = require('domain'),
-	platform          = require('./platform'),
-	isEmpty           = require('lodash.isempty'),
-	clients           = {},
-	addresses         = {},
-	authorizedDevices = {},
+var async     = require('async'),
+	platform  = require('./platform'),
+	isEmpty   = require('lodash.isempty'),
+	clients   = {},
+	addresses = {},
 	server, port;
 
-/*
- * Listen for the message event. Send these messages/commands to devices from this server.
- */
 platform.on('message', function (message) {
 	if (clients[message.device]) {
-		var msg = message.message || new Buffer([0x00]);
+		let msg = message.message || new Buffer([0x00]);
 
 		if (!Buffer.isBuffer(msg))
-			msg = new Buffer(msg + '\r\n');
+			msg = new Buffer(`${msg}\r\n`);
 
-		clients[message.device].write(msg, function () {
+		clients[message.device].write(msg, () => {
 			platform.sendMessageResponse(message.messageId, 'Message Sent');
+
 			platform.log(JSON.stringify({
-				title: 'Message Sent',
+				title: 'TCP Gateway - Message Sent',
 				device: message.device,
 				messageId: message.messageId,
 				message: message.message
@@ -30,167 +27,151 @@ platform.on('message', function (message) {
 	}
 });
 
-/*
- * When a new device is added, add it to the list of authorized devices.
- */
-platform.on('adddevice', function (device) {
-	if (!isEmpty(device) && !isEmpty(device._id)) {
-		authorizedDevices[device._id] = device;
-		platform.log('Successfully added ' + device._id + ' to the pool of authorized devices.');
-	}
-	else
-		platform.handleException(new Error('Device data invalid. Device not added. ' + device));
-});
+platform.on('close', () => {
+	let d = require('domain').create();
 
-/*
- * When a device is removed or deleted, remove it from the list of authorized devices.
- */
-platform.on('removedevice', function (device) {
-	if (!isEmpty(device) && !isEmpty(device._id)) {
-		delete authorizedDevices[device._id];
-		platform.log('Successfully removed ' + device._id + ' from the pool of authorized devices.');
-	}
-	else
-		platform.handleException(new Error('Device data invalid. Device not removed. ' + device));
-});
-
-/*
- * Event to listen to in order to gracefully release all resources bound to this service.
- */
-platform.on('close', function () {
-	var closeDomain = domain.create();
-
-	closeDomain.on('error', function (error) {
-		console.error('Error closing TCP Gateway on port ' + port, error);
+	d.on('error', function (error) {
+		console.error(`Error closing TCP Gateway on port ${port}`, error);
 		platform.handleException(error);
 		platform.notifyClose();
 	});
 
-	closeDomain.run(function () {
-		server.close(function () {
-			console.log('TCP Gateway closed on port ' + port);
+	d.run(function () {
+		server.close(() => {
+			console.log(`TCP Gateway closed on port ${port}`);
 			platform.notifyClose();
 		});
 	});
 });
 
-/*
- * Listen for the ready event.
- */
-platform.once('ready', function (options, registeredDevices) {
-	var net    = require('net'),
-		clone  = require('lodash.clone'),
+platform.once('ready', function (options) {
+	let net    = require('net'),
 		config = require('./config.json');
 
-	if (!isEmpty(registeredDevices)) {
-		var indexBy = require('lodash.indexby');
-		var tmpDevices = clone(registeredDevices, true);
-
-		authorizedDevices = indexBy(tmpDevices, '_id');
-	}
-
-	var connack = options.connack || config.connack.default;
+	let connack = options.connack || config.connack.default;
+	let dataTopic = options.data_topic || config.data_topic.default;
+	let messageTopic = options.message_topic || config.message_topic.default;
+	let groupMessageTopic = options.groupmessage_topic || config.groupmessage_topic.default;
 
 	server = net.createServer();
 	port = options.port;
 
-	server.on('listening', function () {
-		platform.log('TCP Gateway initialized on port ' + options.port);
+	server.on('listening', () => {
+		platform.log(`TCP Gateway initialized on port ${options.port}`);
 		platform.notifyReady();
 	});
 
-	server.on('connection', function (socket) {
+	server.on('connection', (socket) => {
 		socket.setEncoding('utf8');
 		socket.setKeepAlive(true, 5000);
 		socket.setTimeout(3600000);
 
-		socket.on('data', function (data) {
-			var socketDomain = domain.create();
-
-			socketDomain.once('error', function (error) {
-				socket.write(new Buffer('Invalid data sent. This TCP Gateway only accepts JSON data.\r\n'));
-				platform.handleException(error);
-
-				socketDomain.exit();
-			});
-
-			socketDomain.run(function () {
-				var obj = JSON.parse(data);
-
-				if (isEmpty(obj.device)) return socketDomain.exit();
-
-				if (isEmpty(authorizedDevices[obj.device])) {
-					platform.log(JSON.stringify({
-						title: 'Unauthorized Device',
-						device: obj.device
-					}));
-
-					socket.destroy();
-
-					return socketDomain.exit();
+		socket.on('data', (data) => {
+			async.waterfall([
+				async.constant(data || '{}'),
+				async.asyncify(JSON.parse)
+			], (error, obj) => {
+				if (error || isEmpty(obj.topic || isEmpty(obj.device))) {
+					socket.write(new Buffer('Invalid data sent. Data must be a valid JSON String with a "topic" field and a "device" field which corresponds to a registered Device ID.\r\n'));
+					return platform.handleException(new Error('Invalid data sent. Data must be a valid JSON String with a "topic" field and a "device" field which corresponds to a registered Device ID.'));
 				}
 
-				if (obj.type === 'data') {
-					platform.processData(obj.device, data);
-					platform.log(JSON.stringify({
-						title: 'Data Received.',
-						device: obj.device,
-						data: obj
-					}));
+				platform.requestDeviceInfo(obj.device, (error, requestId) => {
+					setTimeout(() => {
+						platform.removeAllListeners(requestId);
+					}, 5000);
 
-					if (isEmpty(clients[obj.device])) {
-						clients[obj.device] = socket;
-						addresses[socket.remoteAddress + ':' + socket.remotePort] = obj.device;
-					}
-				}
-				else if (obj.type === 'message') {
-					platform.sendMessageToDevice(obj.target, obj.message);
+					platform.once(requestId, (deviceInfo) => {
+						if (isEmpty(deviceInfo)) {
+							platform.log(JSON.stringify({
+								title: 'TCP Gateway - Access Denied. Unauthorized Device',
+								device: obj.device
+							}));
 
-					platform.log(JSON.stringify({
-						title: 'Message Sent.',
-						source: obj.device,
-						target: obj.target,
-						message: obj.message
-					}));
-				}
-				else if (obj.type === 'groupmessage') {
-					platform.sendMessageToGroup(obj.target, obj.message);
+							socket.write(new Buffer('Access Denied. Unauthorized Device\r\n'));
+							return socket.destroy();
+						}
 
-					platform.log(JSON.stringify({
-						title: 'Group Message Sent.',
-						source: obj.device,
-						target: obj.target,
-						message: obj.message
-					}));
-				}
-				else
-					socket.write(new Buffer('Invalid data. One or more fields missing. [device, type] are required for data. [device, type, target, message] are required for messages.' + '\r\n'));
+						if (obj.topic === dataTopic) {
+							platform.processData(obj.device, data);
 
-				socketDomain.exit();
+							platform.log(JSON.stringify({
+								title: 'TCP Gateway - Data Received.',
+								device: obj.device,
+								data: obj
+							}));
+
+							if (isEmpty(clients[obj.device])) {
+								clients[obj.device] = socket;
+								addresses[`${socket.remoteAddress}:${socket.remotePort}`] = obj.device;
+							}
+
+							socket.write(new Buffer('Data Received\r\n'));
+						}
+						else if (obj.topic === messageTopic) {
+							if (isEmpty(obj.target) || isEmpty(obj.message)) {
+								platform.handleException(new Error('Invalid message or command. Message must be a valid JSON String with "target" and "message" fields. "target" is a registered Device ID. "message" is the payload.'));
+								return socket.write(new Buffer('Invalid message or command. Message must be a valid JSON String with "target" and "message" fields. "target" is a registered Device ID. "message" is the payload.\r\n'));
+							}
+
+							platform.sendMessageToDevice(obj.target, obj.message);
+
+							platform.log(JSON.stringify({
+								title: 'TCP Gateway - Message Sent.',
+								source: obj.device,
+								target: obj.target,
+								message: obj.message
+							}));
+
+							socket.write(new Buffer('Message Received\r\n'));
+						}
+						else if (obj.topic === groupMessageTopic) {
+							if (isEmpty(obj.target) || isEmpty(obj.message)) {
+								platform.handleException(new Error('Invalid group message or command. Group messages must be a valid JSON String with "target" and "message" fields. "target" is a device group id or name. "message" is the payload.'));
+								return socket.write(new Buffer('Invalid group message or command. Group messages must be a valid JSON String with "target" and "message" fields. "target" is a device group id or name. "message" is the payload.\r\n'));
+							}
+
+							platform.sendMessageToGroup(obj.target, obj.message);
+
+							platform.log(JSON.stringify({
+								title: 'TCP Gateway - Group Message Sent.',
+								source: obj.device,
+								target: obj.target,
+								message: obj.message
+							}));
+
+							socket.write(new Buffer('Group Message Received\r\n'));
+						}
+						else {
+							platform.handleException(new Error(`Invalid topic specified. Topic: ${obj.topic}`));
+							socket.write(new Buffer(`Invalid topic specified. Topic: ${obj.topic}.\r\n`));
+						}
+					});
+				});
 			});
 		});
 
-		socket.on('timeout', function () {
-			platform.log('Socket Timeout.');
+		socket.on('timeout', () => {
+			platform.log('TCP Gateway - Socket Timeout.');
 			socket.destroy();
 		});
 
-		socket.on('error', function (error) {
+		socket.on('error', (error) => {
 			console.error('Client Error.', error);
 			platform.handleException(error);
 		});
 
-		socket.on('close', function () {
-			var device = addresses[socket.remoteAddress + ':' + socket.remotePort];
+		socket.on('close', () => {
+			let device = addresses[`${socket.remoteAddress}:${socket.remotePort}`];
 
 			if (device)
 				platform.notifyDisconnection(device);
 		});
 
-		socket.write(new Buffer(connack + '\r\n'));
+		socket.write(new Buffer(`${connack}\r\n`));
 	});
 
-	server.on('error', function (error) {
+	server.on('error', (error) => {
 		console.error('Server Error', error);
 		platform.handleException(error);
 
